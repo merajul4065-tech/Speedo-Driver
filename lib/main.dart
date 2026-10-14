@@ -1,8 +1,13 @@
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const OnSpeedPartnerApp());
 }
+
+const String firebaseUrl = "https://onspeed-logistics-default-rtdb.firebaseio.com";
 
 class OnSpeedPartnerApp extends StatelessWidget {
   const OnSpeedPartnerApp({super.key});
@@ -31,18 +36,19 @@ class PartnerGate extends StatefulWidget {
 class _PartnerGateState extends State<PartnerGate> {
   bool loggedIn = false;
   String phone = "";
+  String vehicle = "";
 
   @override
   Widget build(BuildContext context) {
     if (!loggedIn) {
-      return PartnerLogin(onDone: (p) => setState(() { phone = p; loggedIn = true; }));
+      return PartnerLogin(onDone: (p, v) => setState(() { phone = p; vehicle = v; loggedIn = true; }));
     }
-    return PartnerDashboard(driverPhone: phone);
+    return PartnerDashboard(driverPhone: phone, vehicleNumber: vehicle);
   }
 }
 
 class PartnerLogin extends StatefulWidget {
-  final Function(String) onDone;
+  final Function(String, String) onDone;
   const PartnerLogin({super.key, required this.onDone});
   @override
   State<PartnerLogin> createState() => _PartnerLoginState();
@@ -104,7 +110,7 @@ class _PartnerLoginState extends State<PartnerLogin> {
                     if (!otpSent) {
                       if (pCtrl.text.length == 10) setState(() => otpSent = true);
                     } else {
-                      if (oCtrl.text == "1234") widget.onDone(pCtrl.text);
+                      if (oCtrl.text == "1234") widget.onDone(pCtrl.text, vCtrl.text);
                     }
                   },
                   child: Text(otpSent ? 'Login to Partner' : 'Get OTP', style: const TextStyle(color: Colors.black87, fontWeight: FontWeight.bold)),
@@ -120,19 +126,82 @@ class _PartnerLoginState extends State<PartnerLogin> {
 
 class PartnerDashboard extends StatefulWidget {
   final String driverPhone;
-  const PartnerDashboard({super.key, required this.driverPhone});
+  final String vehicleNumber;
+  const PartnerDashboard({super.key, required this.driverPhone, required this.vehicleNumber});
   @override
   State<PartnerDashboard> createState() => _PartnerDashboardState();
 }
 
 class _PartnerDashboardState extends State<PartnerDashboard> {
   bool dutyOn = true;
-  bool hasRide = false;
-  bool rideStarted = false;
+  Timer? pollTimer;
+  Map<String, dynamic>? activeOrder;
   final otpInput = TextEditingController();
 
   @override
+  void initState() {
+    super.initState();
+    pollTimer = Timer.periodic(const Duration(seconds: 2), (t) => listenOrders());
+  }
+
+  @override
+  void dispose() {
+    pollTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> listenOrders() async {
+    if (!dutyOn) return;
+    try {
+      final res = await http.get(Uri.parse('$firebaseUrl/active_order.json'));
+      if (res.body != "null" && mounted) {
+        final data = jsonDecode(res.body);
+        setState(() {
+          activeOrder = data;
+        });
+      } else {
+        if (mounted) setState(() => activeOrder = null);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> acceptRide() async {
+    await http.patch(
+      Uri.parse('$firebaseUrl/active_order.json'),
+      body: jsonEncode({
+        "status": "ACCEPTED",
+        "driverName": "Mukesh Partner",
+        "driverPhone": widget.driverPhone,
+        "driverVehicle": widget.vehicleNumber,
+      }),
+    );
+    listenOrders();
+  }
+
+  Future<void> startRide() async {
+    if (otpInput.text == (activeOrder?['otp'] ?? '4829')) {
+      await http.patch(
+        Uri.parse('$firebaseUrl/active_order.json'),
+        body: jsonEncode({"status": "STARTED"}),
+      );
+      listenOrders();
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Invalid OTP')));
+    }
+  }
+
+  Future<void> completeRide() async {
+    await http.patch(
+      Uri.parse('$firebaseUrl/active_order.json'),
+      body: jsonEncode({"status": "COMPLETED"}),
+    );
+    listenOrders();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final status = activeOrder?['status'] ?? 'NONE';
+
     return Scaffold(
       backgroundColor: const Color(0xFF0F172A),
       appBar: AppBar(
@@ -156,47 +225,43 @@ class _PartnerDashboardState extends State<PartnerDashboard> {
             ),
             const SizedBox(height: 16),
             if (!dutyOn)
-              const Expanded(child: Center(child: Text('Turn Duty ON', style: TextStyle(color: Colors.white54))))
-            else if (!hasRide)
-              Expanded(
-                child: Center(
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
-                    onPressed: () => setState(() => hasRide = true),
-                    child: const Text('Simulate Customer Order', style: TextStyle(color: Colors.white)),
-                  ),
-                ),
-              )
+              const Expanded(child: Center(child: Text('Turn Duty ON to receive orders', style: TextStyle(color: Colors.white54))))
+            else if (activeOrder == null || status == 'COMPLETED' || status == 'NONE')
+              const Expanded(child: Center(child: Text('Waiting for Customer Orders...', style: TextStyle(color: Colors.white54))))
             else
               Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(color: const Color(0xFF1E293B), borderRadius: BorderRadius.circular(12)),
                 child: Column(
                   children: [
-                    const Text('TRIP ALERT: ₹290 Cash', style: TextStyle(color: Colors.greenAccent, fontSize: 18, fontWeight: FontWeight.bold)),
+                    Text('TRIP ALERT: ${activeOrder!['fare']} Cash', style: const TextStyle(color: Colors.greenAccent, fontSize: 18, fontWeight: FontWeight.bold)),
                     const SizedBox(height: 8),
-                    const Text('Pickup: Connaught Place\nDrop: Sector 62, Noida', style: TextStyle(color: Colors.white70)),
+                    Text('Pickup: ${activeOrder!['pickup']}\nDrop: ${activeOrder!['drop']}', style: const TextStyle(color: Colors.white70)),
                     const SizedBox(height: 14),
-                    if (!rideStarted) ...[
+                    if (status == 'SEARCHING')
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.amberAccent),
+                        onPressed: acceptRide,
+                        child: const Text('Accept Order', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                      )
+                    else if (status == 'ACCEPTED') ...[
                       TextField(
                         controller: otpInput,
                         keyboardType: TextInputType.number,
                         maxLength: 4,
                         style: const TextStyle(color: Colors.white, letterSpacing: 4),
-                        decoration: const InputDecoration(counterText: '', hintText: 'Enter 4829', hintStyle: TextStyle(color: Colors.white30)),
+                        decoration: const InputDecoration(counterText: '', hintText: 'Enter Customer OTP', hintStyle: TextStyle(color: Colors.white30)),
                       ),
                       ElevatedButton(
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
-                        onPressed: () {
-                          if (otpInput.text == "4829") setState(() => rideStarted = true);
-                        },
-                        child: const Text('Start Trip', style: TextStyle(color: Colors.white)),
+                        onPressed: startRide,
+                        child: const Text('Verify OTP & Start Trip', style: TextStyle(color: Colors.white)),
                       )
-                    ] else ...[
+                    ] else if (status == 'STARTED') ...[
                       ElevatedButton(
                         style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2563EB)),
-                        onPressed: () => setState(() { hasRide = false; rideStarted = false; otpInput.clear(); }),
-                        child: const Text('Complete Trip', style: TextStyle(color: Colors.white)),
+                        onPressed: completeRide,
+                        child: const Text('Complete Trip & Collect Cash', style: TextStyle(color: Colors.white)),
                       )
                     ]
                   ],
